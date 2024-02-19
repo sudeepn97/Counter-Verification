@@ -1,0 +1,481 @@
+interface counter_if(input bit clock);
+logic [3:0]d_in;
+logic [3:0]count;
+logic load;
+logic up_down;
+logic resetn;
+
+clocking dr_cb@(posedge clock);
+        default input #1 output #1;
+        output d_in;
+        output load;
+        output up_down;
+        output resetn;
+endclocking
+
+clocking wr_cb@(posedge clock);
+        default input #1 output #1;
+        input d_in;
+        input load;
+        input up_down;
+        input resetn;
+endclocking
+
+clocking rd_cb@(posedge clock);
+        default input #1 output #1;
+        input count;
+endclocking
+
+modport DRV(clocking dr_cb);
+modport WR_MON(clocking wr_cb);
+modport RD_MON(clocking rd_cb);
+endinterface
+////////////////////////////////////////////////////////////////////////////////
+
+class counter_trans;
+rand logic [3:0]data_in;
+rand logic load;
+rand logic up_down;
+logic resetn;
+logic [3:0]count;
+constraint c1 {data_in inside{[2:8]};}
+constraint c3 {load dist{1 := 30, 0 :=70};}
+constraint c4 {up_down dist{0 := 50,1:=50};}
+
+virtual function void display(input string s);
+begin
+        $display("-------%s------------------------",s);
+        $display("up_down = %d",up_down);
+        $display("load=%d",load);
+        $display("data_in=%d",data_in);
+        $display("count=%d",count);
+        $display("resetn=%d",resetn);
+        $display("-------------------------------------------");
+end
+endfunction
+endclass
+
+/////////////////////////////////////////////////////////////////////////////
+//generator//
+
+class counter_gen;
+        counter_trans trans_h;
+        counter_trans data2send;
+
+        int no_of_transactions;
+        mailbox #(counter_trans)gen2dr;
+
+        function new(mailbox #(counter_trans)gen2dr);
+        this.gen2dr=gen2dr;
+        this.trans_h=new;
+        endfunction
+
+        virtual task start();
+         fork
+          begin
+                for(int i=0; i<no_of_transactions; i++)
+                 begin
+                   assert(trans_h.randomize());
+                   data2send=new trans_h;
+                   gen2dr.put(data2send);
+ end
+          end
+        join_none
+        endtask
+endclass
+
+
+//////////////////////////Write driver/////////////////////////////////////////
+
+class write_drv;
+virtual counter_if.DRV dr_if;
+counter_trans data2duv;
+mailbox #(counter_trans)gen2dr;
+        function new(virtual counter_if.DRV dr_if,
+                     mailbox #(counter_trans)gen2dr);
+                begin
+                  this.dr_if = dr_if;
+                  this.gen2dr = gen2dr;
+                end
+        endfunction
+
+        virtual task drive();
+         begin
+             @(dr_if.dr_cb);
+                dr_if.dr_cb.load<=data2duv.load;
+                dr_if.dr_cb.d_in<=data2duv.data_in;
+                dr_if.dr_cb.up_down<=data2duv.up_down;
+         end
+        endtask
+
+        virtual task start();
+         fork
+            forever
+              begin
+                gen2dr.get(data2duv);
+                drive();
+             end
+         join_none
+        endtask
+endclass
+
+
+/////////////////////////////////write monitor/////////////////////////////////////////
+
+class write_mon;
+        virtual counter_if.WR_MON wrmon_if;
+        counter_trans data2rm;
+        counter_trans wr_data;
+
+        mailbox #(counter_trans)mon2rm;
+
+        function new(virtual counter_if.WR_MON wrmon_if,
+                      mailbox #(counter_trans)mon2rm);
+            begin
+                this.wrmon_if = wrmon_if;
+                this.mon2rm = mon2rm;
+                this.wr_data = new();
+            end
+        endfunction
+
+        virtual task monitor();
+        begin
+          @(wrmon_if.wr_cb);
+          begin
+                wr_data.up_down = wrmon_if.wr_cb.up_down;
+                wr_data.load = wrmon_if.wr_cb.load;
+                wr_data.data_in = wrmon_if.wr_cb.d_in;
+                wr_data.display("FROM WRITE MONITOR");
+         end
+        end
+        endtask
+
+        virtual task start();
+          fork
+           forever
+            begin
+                monitor();
+                data2rm = new wr_data;
+ mon2rm.put(data2rm);
+             end
+          join_none
+        endtask
+endclass
+
+//////////////////////////////////Read monitor////////////////////////////////
+
+class read_mon;
+        virtual counter_if.RD_MON rdmon_if;
+        counter_trans data2sb;
+        counter_trans rd_data;
+        mailbox #(counter_trans)mon2sb;
+
+        function new(virtual counter_if.RD_MON rdmon_if,
+                     mailbox #(counter_trans)mon2sb);
+        begin
+                this.rdmon_if = rdmon_if;
+                this.mon2sb = mon2sb;
+                this.rd_data = new();
+        end
+        endfunction
+
+        virtual task monitor();
+         begin
+           @(rdmon_if.rd_cb);
+            begin
+                rd_data.count=rdmon_if.rd_cb.count;
+                rd_data.display("FROM READ MONITOR");
+             end
+         end
+        endtask
+
+        virtual task start();
+         fork
+           forever
+             begin
+                monitor();
+                data2sb=new rd_data;
+                mon2sb.put(data2sb);
+              end
+           join_none
+        endtask
+endclass
+
+//////////////////////////Reference model///////////////////
+
+class counter_model;
+
+        counter_trans w_data;
+
+        static logic[3:0]ref_count=0;
+
+        mailbox #(counter_trans)wrmon2rm;
+        mailbox #(counter_trans)rm2sb;
+
+        function new(mailbox #(counter_trans)wrmon2rm,
+                     mailbox #(counter_trans)rm2sb);
+        this.wrmon2rm=wrmon2rm;
+        this.rm2sb=rm2sb;
+        endfunction
+
+        virtual task count_mod(counter_trans model_counter);
+          begin
+           if(model_counter.load)
+             ref_count<=model_counter.data_in;
+            wait(model_counter.load==0)
+             begin
+               if(model_counter.up_down==0)
+                begin
+                 if(ref_count>12)
+                        ref_count<=4'd0;
+                else
+                        ref_count<=ref_count+1'b1;
+                end
+                else if(model_counter.up_down==1)
+                   begin
+                     if((ref_count>10)||(ref_count<2))
+ ref_count<=4'd10;
+                   else
+                        ref_count<=ref_count-1'b1;
+                  end
+        end
+        end
+        endtask
+
+        virtual task start();
+         fork
+            begin
+                forever
+                   begin
+                        wrmon2rm.get(w_data);
+                        count_mod(w_data);
+                        w_data.count=ref_count;
+                        rm2sb.put(w_data);
+                   end
+             end
+          join_none
+        endtask
+endclass
+
+////////////////////////////Score board/////////////////////////
+
+class counter_sb;
+
+        event DONE;
+        counter_trans r_data;
+        counter_trans sb_data;
+
+        static int ref_data;
+        static int rm_data;
+        static int data_verified;
+
+        mailbox #(counter_trans)ref2sb;
+ mailbox #(counter_trans)rdm2sb;
+
+        function new(mailbox #(counter_trans)ref2sb,
+                     mailbox #(counter_trans)rdm2sb);
+        this.ref2sb=ref2sb;
+        this.rdm2sb=rdm2sb;
+        endfunction
+
+        virtual task start();
+         fork
+           forever
+             begin
+                ref2sb.get(r_data);
+                ref_data++;
+                rdm2sb.get(sb_data);
+                rm_data++;
+
+                check(sb_data);
+             end
+         join_none
+        endtask
+
+        virtual task check(counter_trans rdata);
+        int no_of_transactions;
+         begin
+          if(r_data.count==rdata.count)
+                $display("count Matches");
+          else
+                $display("Count not matching");
+         end
+        data_verified++;
+        if(data_verified>=no_of_transactions + 2)
+            begin
+             ->DONE;
+            end
+        endtask
+
+        virtual function void report();
+                $display("-------------SCORE BOARD-------------------------");
+ $display("Data_generated = %d",rm_data);
+                $display("Data_verified = %d",data_verified);
+                $display("-------------------------------------------------");
+        endfunction
+endclass
+
+//////////////////////////////Environment//////////////////////////
+
+class counter_env;
+
+        virtual counter_if.DRV dr_if;
+        virtual counter_if.WR_MON wrmon_if;
+        virtual counter_if.RD_MON rdmon_if;
+
+        mailbox #(counter_trans)gen2dr=new();
+        mailbox #(counter_trans)rm2sb=new();
+        mailbox #(counter_trans)mon2sb=new();
+        mailbox #(counter_trans)mon2rm=new();
+
+        counter_gen gen_h;
+        write_mon wrmon_h;
+        write_drv dri_h;
+        read_mon rdmon_h;
+        counter_sb sb_h;
+        counter_model mod_h;
+
+        function new(virtual counter_if.DRV dr_if,
+                     virtual counter_if.WR_MON wrmon_if,
+                     virtual counter_if.RD_MON rdmon_if);
+        this.dr_if=dr_if;
+        this.wrmon_if=wrmon_if;
+        this.rdmon_if=rdmon_if;
+        endfunction
+
+        virtual task build();
+         gen_h=new(gen2dr);
+         dri_h=new(dr_if,gen2dr);
+         wrmon_h=new(wrmon_if,mon2rm);
+         rdmon_h=new(rdmon_if,mon2sb);
+   mod_h=new(mon2rm,rm2sb);
+         sb_h=new(rm2sb,mon2sb);
+        endtask
+
+        virtual task reset_duv();
+         @(dr_if.dr_cb);
+            dr_if.dr_cb.resetn<=1'b0;
+             repeat(2)
+                @(dr_if.dr_cb);
+            dr_if.dr_cb.resetn <=1'b1;
+        endtask
+
+        virtual task start();
+                gen_h.start;
+                dri_h.start;
+                wrmon_h.start;
+                rdmon_h.start;
+                mod_h.start;
+                sb_h.start;
+        endtask
+
+        virtual task stop();
+           wait(sb_h.DONE.triggered);
+        endtask
+
+        virtual task run();
+                reset_duv();
+                start();
+                stop();
+                sb_h.report();
+        endtask
+endclass
+
+///////////////////////////Package////////////////////
+
+ package count_pkg;
+        int no_of_transactions=1;
+
+endpackage
+//////////////////////////////Testcases///////////////
+class test;
+        virtual counter_if.DRV dr_if;
+        virtual counter_if.WR_MON wrmon_if;
+        virtual counter_if.RD_MON rdmon_if;
+
+        counter_env env_h;
+
+        function new(virtual counter_if.DRV dr_if,
+                     virtual counter_if.WR_MON wrmon_if,
+                     virtual counter_if.RD_MON rdmon_if);
+        this.dr_if=dr_if;
+        this.wrmon_if=wrmon_if;
+        this.rdmon_if=rdmon_if;
+
+        env_h=new(dr_if,wrmon_if,rdmon_if);
+        endfunction
+
+        virtual task build();
+                env_h.build();
+        endtask
+
+        virtual task run();
+                env_h.run();
+        endtask
+endclass
+
+
+///////////////////////////Top module/////////////////////
+
+module top();
+        int no_of_transactions;
+
+        reg clock;
+
+        counter_if DUV_IF(clock);
+
+        test t_h;
+  counter DUV(.clock(clock),
+                    .d_in(DUV_IF.d_in),
+                    .load(DUV_IF.load),
+                    .up_down(DUV_IF.up_down),
+                    .resetn(DUV_IF.resetn),
+                    .count(DUV_IF.count));
+
+        initial
+         begin
+            clock=1'b0;
+            forever
+                #10 clock=~clock;
+         end
+
+        initial
+         begin
+           if($test$plusargs("TEST1"))
+             begin
+                t_h=new(DUV_IF,DUV_IF,DUV_IF);
+                no_of_transactions=200;
+                t_h.build();
+                t_h.run();
+                $finish;
+              end
+
+          end
+endmodule
+
+--------------------------------------------------------------------------------------
+
+module counter(input clock,input[3:0]d_in,input load,up_down,resetn,output reg[3:0]count);
+
+always@(posedge clock)
+begin
+        if(resetn)
+                count<=4'b0000;
+        else if(load)
+                count<=d_in;
+        else if(up_down==0)
+        begin
+ if(count>12)
+                            count<=4'b0;
+                else
+                     count<=count+1'b1;
+        end
+        else
+        begin
+                if((count>10)||(count<2))
+                  count<=4'd10;
+                else
+                    count<=count-1'b1;
+        end
+end
+endmodule
